@@ -121,6 +121,7 @@ struct esp32s3_uart_s
 
 extern struct esp32s3_uart_s g_uart0_config;
 extern struct esp32s3_uart_s g_uart1_config;
+extern struct esp32s3_uart_s g_uart2_config;
 
 /****************************************************************************
  * Public Function Prototypes

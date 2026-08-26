@@ -37,6 +37,7 @@
 #include <nuttx/arch.h>
 #include <nuttx/irq.h>
 #include <nuttx/kmalloc.h>
+#include <nuttx/init.h>
 #include <nuttx/serial/serial.h>
 #include <nuttx/serial/tioctl.h>
 #include <arch/irq.h>
@@ -53,9 +54,13 @@
  * Pre-processor Macros
  ****************************************************************************/
 
-/* The hardware buffer has a fixed size of 64 bytes */
+/* The hardware TX FIFO accepts up to 64 bytes per WR_DONE.  A full 64-byte
+ * USB bulk packet may be held by the host until the next packet; stay at 63.
+ */
 
-#define ESP32S3_USBCDC_BUFFERSIZE 64
+#define ESP32S3_USBCDC_BUFFERSIZE   256
+#define ESP32S3_USB_TX_CHUNK        63
+#define ESP32S3_USB_TX_WAIT_RETRIES 40000
 
 /****************************************************************************
  * Private Types
@@ -90,12 +95,24 @@ static void esp32s3_send(struct uart_dev_s *dev, int ch);
 static int  esp32s3_receive(struct uart_dev_s *dev, unsigned int *status);
 static int  esp32s3_ioctl(struct file *filep, int cmd, unsigned long arg);
 
+static bool esp32s3_usb_hw_tx_free(void);
+static void esp32s3_usb_hw_tx_flush_locked(void);
+static void esp32s3_usb_hw_tx_queue(uint8_t ch);
+static void esp32s3_hw_send_char(int ch);
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
 
 static char g_rxbuffer[ESP32S3_USBCDC_BUFFERSIZE];
 static char g_txbuffer[ESP32S3_USBCDC_BUFFERSIZE];
+
+/* Batch bytes into one USB IN packet instead of WR_DONE per character (~1ms
+ * each on full-speed USB, which looks like typewriter output in minicom).
+ */
+
+static uint8_t g_hw_txbuf[ESP32S3_USB_TX_CHUNK];
+static size_t  g_hw_txlen;
 
 static struct esp32s3_priv_s g_usbserial_priv =
 {
@@ -148,13 +165,6 @@ uart_dev_t g_uart_usbserial =
 
 /****************************************************************************
  * Name: esp32s3_interrupt
- *
- * Description:
- *   This is the common UART interrupt handler.  It will be invoked
- *   when an interrupt received on the device.  It should call
- *   uart_transmitchars or uart_receivechar to perform the appropriate data
- *   transfers.
- *
  ****************************************************************************/
 
 static int esp32s3_interrupt(int irq, void *context, void *arg)
@@ -164,16 +174,12 @@ static int esp32s3_interrupt(int irq, void *context, void *arg)
 
   regval = getreg32(USB_SERIAL_JTAG_INT_ST_REG);
 
-  /* Send buffer has room and can accept new data. */
-
   if (regval & USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ST)
     {
       putreg32(USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_CLR,
                USB_SERIAL_JTAG_INT_CLR_REG);
       uart_xmitchars(dev);
     }
-
-  /* Data from the host are available to read. */
 
   if (regval & USB_SERIAL_JTAG_SERIAL_OUT_RECV_PKT_INT_ST)
     {
@@ -185,63 +191,51 @@ static int esp32s3_interrupt(int irq, void *context, void *arg)
   return OK;
 }
 
-/****************************************************************************
- * Name: esp32s3_setup
- *
- * Description:
- *   This method is called the first time that the serial port is opened.
- *
- ****************************************************************************/
-
 static int esp32s3_setup(struct uart_dev_s *dev)
 {
+  (void)dev;
+
+  modifyreg32(SYSTEM_PERIP_CLK_EN0_REG, 0, SYSTEM_USB_DEVICE_CLK_EN);
+  modifyreg32(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_USB_DEVICE_RST, 0);
+  modifyreg32(USB_SERIAL_JTAG_CONF0_REG, 0, USB_SERIAL_JTAG_USB_PAD_ENABLE);
+  modifyreg32(USB_SERIAL_JTAG_MEM_CONF_REG, USB_SERIAL_JTAG_USB_MEM_PD,
+              USB_SERIAL_JTAG_USB_MEM_CLK_EN);
+  putreg32(UINT32_MAX, USB_SERIAL_JTAG_INT_CLR_REG);
   return OK;
 }
 
-/****************************************************************************
- * Name: esp32s3_shutdown
- *
- * Description:
- *   This method is called when the serial port is closed.
- *
- ****************************************************************************/
-
 static void esp32s3_shutdown(struct uart_dev_s *dev)
 {
+  UNUSED(dev);
 }
-
-/****************************************************************************
- * Name: esp32s3_txint
- *
- * Description:
- *   Call to enable or disable TX interrupts
- *
- ****************************************************************************/
 
 static void esp32s3_txint(struct uart_dev_s *dev, bool enable)
 {
+  irqstate_t flags = enter_critical_section();
+
   if (enable)
     {
       modifyreg32(USB_SERIAL_JTAG_INT_ENA_REG, 0,
                   USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ENA);
+
+      if (esp32s3_txready(dev))
+        {
+          uart_xmitchars(dev);
+        }
     }
   else
     {
       modifyreg32(USB_SERIAL_JTAG_INT_ENA_REG,
                   USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ENA, 0);
     }
-}
 
-/****************************************************************************
- * Name: esp32s3_rxint
- *
- * Description:
- *   Call to enable or disable RXRDY interrupts
- *
- ****************************************************************************/
+  leave_critical_section(flags);
+}
 
 static void esp32s3_rxint(struct uart_dev_s *dev, bool enable)
 {
+  UNUSED(dev);
+
   if (enable)
     {
       modifyreg32(USB_SERIAL_JTAG_INT_ENA_REG, 0,
@@ -254,30 +248,12 @@ static void esp32s3_rxint(struct uart_dev_s *dev, bool enable)
     }
 }
 
-/****************************************************************************
- * Name: esp32s3_attach
- *
- * Description:
- *   Configure the UART to operation in interrupt driven mode.  This method
- *   is called when the serial port is opened.  Normally, this is just after
- *   the the setup() method is called, however, the serial console may
- *   operate in a non-interrupt driven mode during the boot phase.
- *
- *   RX and TX interrupts are not enabled by the attach method (unless
- *   the hardware supports multiple levels of interrupt enabling).  The RX
- *   and TX interrupts are not enabled until the txint() and rxint() methods
- *   are called.
- *
- ****************************************************************************/
-
 static int esp32s3_attach(struct uart_dev_s *dev)
 {
   struct esp32s3_priv_s *priv = dev->priv;
   int ret;
 
   DEBUGASSERT(priv->cpuint == -ENOMEM);
-
-  /* Try to attach the IRQ to a CPU int */
 
   priv->cpu = up_cpu_index();
   priv->cpuint = esp32s3_setup_irq(priv->cpu, priv->periph,
@@ -288,8 +264,6 @@ static int esp32s3_attach(struct uart_dev_s *dev)
       return priv->cpuint;
     }
 
-  /* Attach and enable the IRQ */
-
   ret = irq_attach(priv->irq, esp32s3_interrupt, dev);
   if (ret == OK)
     {
@@ -298,16 +272,6 @@ static int esp32s3_attach(struct uart_dev_s *dev)
 
   return ret;
 }
-
-/****************************************************************************
- * Name: esp32s3_detach
- *
- * Description:
- *   Detach UART interrupts.  This method is called when the serial port is
- *   closed normally just before the shutdown method is called.  The
- *   exception is the serial console which is never shutdown.
- *
- ****************************************************************************/
 
 static void esp32s3_detach(struct uart_dev_s *dev)
 {
@@ -322,103 +286,151 @@ static void esp32s3_detach(struct uart_dev_s *dev)
   priv->cpuint = -ENOMEM;
 }
 
-/****************************************************************************
- * Name: esp32s3_rxavailable
- *
- * Description:
- *   Return true if the receive holding register is not empty
- *
- ****************************************************************************/
-
 static bool esp32s3_rxavailable(struct uart_dev_s *dev)
 {
   uint32_t regval;
+
+  UNUSED(dev);
 
   regval = getreg32(USB_SERIAL_JTAG_EP1_CONF_REG);
 
   return regval & USB_SERIAL_JTAG_SERIAL_OUT_EP_DATA_AVAIL;
 }
 
-/****************************************************************************
- * Name: esp32s3_txempty
- *
- * Description:
- *   Return true if the transmit holding register is empty (TXRDY)
- *
- ****************************************************************************/
-
 static bool esp32s3_txempty(struct uart_dev_s *dev)
 {
-  uint32_t regval;
+  uint32_t retries = ESP32S3_USB_TX_WAIT_RETRIES;
+  irqstate_t flags;
 
-  regval = getreg32(USB_SERIAL_JTAG_JFIFO_ST_REG);
+  UNUSED(dev);
 
-  return regval & USB_SERIAL_JTAG_OUT_FIFO_EMPTY;
+  flags = enter_critical_section();
+  esp32s3_usb_hw_tx_flush_locked();
+
+  while (!esp32s3_usb_hw_tx_free())
+    {
+      if (retries-- == 0)
+        {
+          leave_critical_section(flags);
+          return false;
+        }
+    }
+
+  leave_critical_section(flags);
+  return true;
 }
-
-/****************************************************************************
- * Name: esp32s3_txready
- *
- * Description:
- *   Return true if the transmit holding register is empty (TXRDY)
- *
- ****************************************************************************/
 
 static bool esp32s3_txready(struct uart_dev_s *dev)
 {
-  uint32_t regval;
+  UNUSED(dev);
 
-  regval = getreg32(USB_SERIAL_JTAG_EP1_CONF_REG);
+  if (g_hw_txlen < ESP32S3_USB_TX_CHUNK)
+    {
+      return true;
+    }
 
-  return regval & USB_SERIAL_JTAG_SERIAL_IN_EP_DATA_FREE;
+  return esp32s3_usb_hw_tx_free();
 }
 
-/****************************************************************************
- * Name: esp32s3_send
- *
- * Description:
- *   This method will send one byte on the UART.
- *
- ****************************************************************************/
+static bool esp32s3_usb_hw_tx_free(void)
+{
+  return (getreg32(USB_SERIAL_JTAG_EP1_CONF_REG) &
+          USB_SERIAL_JTAG_SERIAL_IN_EP_DATA_FREE) != 0;
+}
+
+static void esp32s3_usb_hw_tx_flush_locked(void)
+{
+  size_t i;
+  uint32_t retries = ESP32S3_USB_TX_WAIT_RETRIES;
+
+  if (g_hw_txlen == 0)
+    {
+      return;
+    }
+
+  while (!esp32s3_usb_hw_tx_free())
+    {
+      if (retries-- == 0)
+        {
+          g_hw_txlen = 0;
+          return;
+        }
+    }
+
+  for (i = 0; i < g_hw_txlen; i++)
+    {
+      putreg32(g_hw_txbuf[i], USB_SERIAL_JTAG_EP1_REG);
+    }
+
+  putreg32(USB_SERIAL_JTAG_WR_DONE, USB_SERIAL_JTAG_EP1_CONF_REG);
+  g_hw_txlen = 0;
+}
+
+static void esp32s3_usb_hw_tx_queue(uint8_t ch)
+{
+  if (g_hw_txlen >= ESP32S3_USB_TX_CHUNK)
+    {
+      esp32s3_usb_hw_tx_flush_locked();
+    }
+
+  g_hw_txbuf[g_hw_txlen++] = ch;
+
+  if (g_hw_txlen >= ESP32S3_USB_TX_CHUNK)
+    {
+      esp32s3_usb_hw_tx_flush_locked();
+    }
+}
+
+static void esp32s3_hw_send_char(int ch)
+{
+  irqstate_t flags = enter_critical_section();
+
+  esp32s3_usb_hw_tx_queue((uint8_t)ch);
+
+  if (ch == '\n' || ch == '\r')
+    {
+      esp32s3_usb_hw_tx_flush_locked();
+    }
+
+  leave_critical_section(flags);
+}
 
 static void esp32s3_send(struct uart_dev_s *dev, int ch)
 {
-  /* Write the character to the buffer. */
+  int nexttail = dev->xmit.tail + 1;
+  irqstate_t flags;
 
-  putreg32(ch, USB_SERIAL_JTAG_EP1_REG);
+  if (nexttail >= dev->xmit.size)
+    {
+      nexttail = 0;
+    }
 
-  /* Flush the character out. */
+  flags = enter_critical_section();
+  esp32s3_usb_hw_tx_queue((uint8_t)ch);
 
-  putreg32(USB_SERIAL_JTAG_WR_DONE, USB_SERIAL_JTAG_EP1_CONF_REG);
+  if (g_hw_txlen > 0 && nexttail == dev->xmit.head)
+    {
+      esp32s3_usb_hw_tx_flush_locked();
+    }
+
+  leave_critical_section(flags);
 }
-
-/****************************************************************************
- * Name: esp32s3_receive
- *
- * Description:
- *   Called (usually) from the interrupt level to receive one character.
- *
- ****************************************************************************/
 
 static int esp32s3_receive(struct uart_dev_s *dev, unsigned int *status)
 {
+  UNUSED(dev);
+
   *status = 0;
   return getreg32(USB_SERIAL_JTAG_EP1_REG) & USB_SERIAL_JTAG_RDWR_BYTE;
 }
-
-/****************************************************************************
- * Name: esp32s3_ioctl
- *
- * Description:
- *   All ioctl calls will be routed through this method
- *
- ****************************************************************************/
 
 static int esp32s3_ioctl(struct file *filep, int cmd, unsigned long arg)
 {
 #if defined(CONFIG_SERIAL_TERMIOS)
   struct inode      *inode = filep->f_inode;
   struct uart_dev_s *dev   = inode->i_private;
+#else
+  UNUSED(filep);
 #endif
   int                ret   = OK;
 
@@ -435,12 +447,9 @@ static int esp32s3_ioctl(struct file *filep, int cmd, unsigned long arg)
           }
         else
           {
-            /* The USB Serial Console has fixed configuration of:
-             *    9600 baudrate, no parity, 8 bits, 1 stopbit.
-             */
-
             termiosp->c_cflag = CS8;
-            cfsetispeed(termiosp, 9600);
+            cfsetispeed(termiosp, B115200);
+            cfsetospeed(termiosp, B115200);
           }
       }
       break;
@@ -455,6 +464,7 @@ static int esp32s3_ioctl(struct file *filep, int cmd, unsigned long arg)
       break;
     }
 
+  UNUSED(dev);
   return ret;
 }
 
@@ -462,19 +472,7 @@ static int esp32s3_ioctl(struct file *filep, int cmd, unsigned long arg)
  * Public Functions
  ****************************************************************************/
 
-/****************************************************************************
- * Name: esp32s3_usbserial_write
- *
- * Description:
- *   Write one character through the USB serial.  Used mainly for early
- *   debugging.
- *
- ****************************************************************************/
-
 void esp32s3_usbserial_write(char ch)
 {
-  while (!esp32s3_txready(&g_uart_usbserial));
-
-  esp32s3_send(&g_uart_usbserial, ch);
+  esp32s3_hw_send_char(ch);
 }
-

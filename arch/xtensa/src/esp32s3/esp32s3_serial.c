@@ -94,8 +94,11 @@
 #endif /* CONSOLE_UART */
 
 #ifdef CONFIG_ESP32S3_USBSERIAL
-#  define CONSOLE_DEV           g_uart_usbserial
 #  define TTYACM0_DEV           g_uart_usbserial
+#  ifndef CONSOLE_UART
+#    undef  CONSOLE_DEV
+#    define CONSOLE_DEV         g_uart_usbserial
+#  endif
 #endif
 
 /* Pick ttyS1 */
@@ -106,6 +109,11 @@
 #elif defined(CONFIG_ESP32S3_UART1) && !defined(UART1_ASSIGNED)
 #  define TTYS1_DEV           g_uart1_dev  /* UART1 is ttyS1 */
 #  define UART1_ASSIGNED      1
+#endif
+
+#if defined(CONFIG_ESP32S3_UART2) && !defined(UART2_ASSIGNED)
+#  define TTYS2_DEV           g_uart2_dev  /* UART2 is ttyS2 */
+#  define UART2_ASSIGNED      1
 #endif
 
 #ifdef HAVE_UART_DEVICE
@@ -225,6 +233,37 @@ static uart_dev_t g_uart1_dev =
 
   .ops  = &g_uart_ops,
   .priv = &g_uart1_config
+};
+
+#endif
+
+/* UART 2 */
+
+#ifdef CONFIG_ESP32S3_UART2
+
+static char g_uart2_rxbuffer[CONFIG_UART2_RXBUFSIZE];
+static char g_uart2_txbuffer[CONFIG_UART2_TXBUFSIZE];
+
+static uart_dev_t g_uart2_dev =
+{
+#ifdef CONFIG_UART2_SERIAL_CONSOLE
+  .isconsole = true,
+#else
+  .isconsole = false,
+#endif
+  .xmit =
+  {
+    .size   = CONFIG_UART2_TXBUFSIZE,
+    .buffer = g_uart2_txbuffer,
+  },
+  .recv =
+  {
+    .size   = CONFIG_UART2_RXBUFSIZE,
+    .buffer = g_uart2_rxbuffer,
+  },
+
+  .ops  = &g_uart_ops,
+  .priv = &g_uart2_config
 };
 
 #endif
@@ -1089,6 +1128,10 @@ void xtensa_serialinit(void)
 
 #ifdef TTYS1_DEV
   uart_register("/dev/ttyS1", &TTYS1_DEV);
+#endif
+
+#ifdef TTYS2_DEV
+  uart_register("/dev/ttyS2", &TTYS2_DEV);
 #endif
 
 #ifdef CONFIG_ESP32S3_USBSERIAL

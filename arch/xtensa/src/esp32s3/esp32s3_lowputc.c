@@ -50,6 +50,9 @@
 #include "esp32s3_gpio.h"
 
 #include "esp32s3_lowputc.h"
+#ifdef CONFIG_ESP32S3_USBSERIAL
+#  include "esp32s3_usbserial.h"
+#endif
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -142,6 +145,45 @@ struct esp32s3_uart_s g_uart1_config =
 };
 
 #endif /* CONFIG_ESP32S3_UART1 */
+
+#ifdef CONFIG_ESP32S3_UART2
+
+struct esp32s3_uart_s g_uart2_config =
+{
+  .periph = ESP32S3_PERIPH_UART2,
+  .id = 2,
+  .cpuint = -ENOMEM,
+  .irq = ESP32S3_IRQ_UART2,
+  .baud = CONFIG_UART2_BAUD,
+  .bits = CONFIG_UART2_BITS,
+  .parity = CONFIG_UART2_PARITY,
+  .stop_b2 = CONFIG_UART2_2STOP,
+  .int_pri = ESP32S3_INT_PRIO_DEF,
+  .txpin = CONFIG_ESP32S3_UART2_TXPIN,
+  .txsig = U2TXD_OUT_IDX,
+  .rxpin = CONFIG_ESP32S3_UART2_RXPIN,
+  .rxsig = U2RXD_IN_IDX,
+#ifdef CONFIG_SERIAL_IFLOWCONTROL
+  .rtspin = CONFIG_ESP32S3_UART2_RTSPIN,
+  .rtssig = U2RTS_OUT_IDX,
+#ifdef CONFIG_UART2_IFLOWCONTROL
+  .iflow = true,
+#else
+  .iflow = false,
+#endif
+#endif
+#ifdef CONFIG_SERIAL_OFLOWCONTROL
+  .ctspin = CONFIG_ESP32S3_UART2_CTSPIN,
+  .ctssig = U2CTS_IN_IDX,
+#ifdef CONFIG_UART2_OFLOWCONTROL
+  .oflow = true,
+#else
+  .oflow = false,
+#endif
+#endif
+};
+
+#endif /* CONFIG_ESP32S3_UART2 */
 #endif /* HAVE_UART_DEVICE */
 
 /****************************************************************************
@@ -896,6 +938,14 @@ void up_lowputc(char ch)
   /* Then send the character */
 
   esp32s3_lowputc_send_byte(priv, ch);
+
+#elif defined(CONFIG_ESP32S3_USBSERIAL)
+  /* USB Serial/JTAG is the console (no UART CONSOLE_UART). Without this,
+   * up_putc/syslog/NSH early bytes are silently dropped and minicom
+   * only sees the ROM bootloader log. CR/LF is handled by up_putc().
+   */
+
+  esp32s3_usbserial_write(ch);
 #endif /* CONSOLE_UART */
 }
 
@@ -920,6 +970,12 @@ void esp32s3_lowsetup(void)
 #ifdef CONFIG_ESP32S3_UART1
 
   esp32s3_lowputc_config_pins(&g_uart1_config);
+
+#endif
+
+#ifdef CONFIG_ESP32S3_UART2
+
+  esp32s3_lowputc_config_pins(&g_uart2_config);
 
 #endif
 

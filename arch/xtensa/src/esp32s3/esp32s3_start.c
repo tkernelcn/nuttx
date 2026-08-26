@@ -39,6 +39,7 @@
 #include "esp32s3_region.h"
 #include "esp32s3_spiram.h"
 #include "esp32s3_wdt.h"
+#include "rom/esp32s3_libc_stubs.h"
 #include "hardware/esp32s3_cache_memory.h"
 #include "hardware/esp32s3_system.h"
 
@@ -258,6 +259,12 @@ void noreturn_function IRAM_ATTR __esp32s3_start(void)
     {
       *dest = 0;
     }
+
+  /* ROM newlib (strtoul, printf, …) calls through syscall_table_ptr.
+   * Leaving it NULL LoadProhibits at 0x40050c30 (EXCVADDR=0).
+   */
+
+  esp_setup_syscall_table();
 
 #ifndef CONFIG_SMP
   /* Make sure that the APP_CPU is disabled for now */
