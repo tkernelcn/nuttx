@@ -1340,7 +1340,13 @@ static void esp32s3_spi_init(struct spi_dev_s *dev)
   esp32s3_gpiowrite(config->clk_pin, true);
 
 #if SPI_HAVE_SWCS
-  esp32s3_configgpio(config->cs_pin, OUTPUT_FUNCTION_1);
+  /* FUNCTION_n encodes MCU_SEL = n - 1. GPIO is MCU_SEL 1 on every pad
+   * (PIN_FUNC_GPIO), so software CS uses FUNCTION_2 on any pin. FUNCTION_1
+   * selects that pin's IOMUX function 0, which is never GPIO, so later
+   * GPIO writes do not toggle the pin.
+   */
+
+  esp32s3_configgpio(config->cs_pin, OUTPUT_FUNCTION_2);
   esp32s3_gpio_matrix_out(config->cs_pin, SIG_GPIO_OUT_IDX, 0, 0);
 #endif
 

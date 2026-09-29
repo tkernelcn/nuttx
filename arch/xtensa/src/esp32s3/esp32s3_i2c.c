@@ -43,6 +43,7 @@
 #include <nuttx/i2c/i2c_master.h>
 #include <nuttx/semaphore.h>
 #include <nuttx/spinlock.h>
+#include <syslog.h>
 
 #include <arch/board/board.h>
 
@@ -51,6 +52,7 @@
 #include "esp32s3_irq.h"
 
 #include "xtensa.h"
+#include "hardware/esp32s3_gpio.h"
 #include "hardware/esp32s3_gpio_sigmap.h"
 #include "hardware/esp32s3_i2c.h"
 #include "hardware/esp32s3_soc.h"
@@ -95,6 +97,17 @@
                           I2C_ARBITRATION_LOST_INT_ENA)
 
 #define I2C_SCL_CYC_NUM_DEF 9
+
+/* ESP32-S3 GPIO0-21 are RTC pads. MUX_SEL (bit 19) selects the RTC mux,
+ * which ignores the digital GPIO matrix. Reset defaults leave the RTC
+ * pulldown (bit 28) set on some pads. IDF gpio_config() calls
+ * rtc_gpio_deinit(); this driver has to do the same or SCL never toggles.
+ */
+
+#define I2C_RTC_PAD_REG(pin) (DR_REG_RTCIO_BASE + 0x84 + ((pin) * 4))
+#define I2C_RTC_PAD_CLEAR    (BIT(28) | BIT(27) | BIT(19) | \
+                              BIT(16) | BIT(15) | BIT(14) | BIT(13))
+#define I2C_RTC_ENABLE_W1TC  (DR_REG_RTCIO_BASE + 0x14)
 
 /* I2C event trace logic.
  * NOTE: trace uses the internal, non-standard, low-level debug interface
@@ -263,8 +276,11 @@ static int i2c_sem_waitdone(struct esp32s3_i2c_priv_s *priv);
 #ifdef CONFIG_I2C_POLLED
 static int i2c_polling_waitdone(struct esp32s3_i2c_priv_s *priv);
 #endif
+#ifdef CONFIG_I2C_RESET
 static void i2c_clear_bus(struct esp32s3_i2c_priv_s *priv);
+#endif
 static void i2c_reset_fsmc(struct esp32s3_i2c_priv_s *priv);
+static void i2c_release_rtc_pin(uint32_t pin);
 #ifdef CONFIG_I2C_RESET
 static int i2c_reset(struct i2c_master_s *dev);
 #endif
@@ -658,14 +674,14 @@ static void i2c_init_clock(struct esp32s3_i2c_priv_s *priv,
   modifyreg32(I2C_CLK_CONF_REG(priv->id), I2C_SCLK_DIV_NUM_M,
               VALUE_TO_FIELD((clkm_div - 1), I2C_SCLK_DIV_NUM));
 
-  /* According to the Technical Reference Manual, the following timings must
-   * be subtracted by 1.
-   * Moreover, the frequency calculation also shows that we must subtract 3
-   * to the total SCL.
+  /* Match the w2016561536 ESP32-S3 NuttX used by the boards that complete
+   * I2C transfers: only the TRM's "- 1". Subtracting again makes SCL run
+   * fast and the sample point misses, so the completion IRQ never comes
+   * and every address waits out the 500 ms timeout.
    */
 
   scl_low       = half_cycle;
-  putreg32(scl_low - 1 - 2, I2C_SCL_LOW_PERIOD_REG(priv->id));
+  putreg32(scl_low - 1, I2C_SCL_LOW_PERIOD_REG(priv->id));
 
   /* By default, scl_wait_high must be less than scl_high.
    * A time compensation is needed for when the bus frequency is higher
@@ -676,8 +692,8 @@ static void i2c_init_clock(struct esp32s3_i2c_priv_s *priv,
                                         (half_cycle / 5 * 4 + 4);
   scl_wait_high = half_cycle - scl_high;
 
-  reg_value     = VALUE_TO_FIELD(scl_high - 1 - 1, I2C_SCL_HIGH_PERIOD);
-  reg_value    |= VALUE_TO_FIELD(scl_wait_high - 1 - 1,
+  reg_value     = VALUE_TO_FIELD(scl_high, I2C_SCL_HIGH_PERIOD);
+  reg_value    |= VALUE_TO_FIELD(scl_wait_high,
                                  I2C_SCL_WAIT_HIGH_PERIOD);
   putreg32(reg_value, I2C_SCL_HIGH_PERIOD_REG(priv->id));
 
@@ -726,6 +742,9 @@ static void i2c_init_clock(struct esp32s3_i2c_priv_s *priv,
 static void i2c_init(struct esp32s3_i2c_priv_s *priv)
 {
   const struct esp32s3_i2c_config_s *config = priv->config;
+
+  i2c_release_rtc_pin(config->scl_pin);
+  i2c_release_rtc_pin(config->sda_pin);
 
   esp32s3_gpiowrite(config->scl_pin, 1);
   esp32s3_configgpio(config->scl_pin, INPUT_PULLUP | OUTPUT_OPEN_DRAIN);
@@ -815,11 +834,33 @@ static void i2c_deinit(struct esp32s3_i2c_priv_s *priv)
 
 static void i2c_reset_fsmc(struct esp32s3_i2c_priv_s *priv)
 {
-  /* Reset FSM machine */
+  /* Reset FSM machine. Do not pulse SCL_RST_SLV here: that nine-clock
+   * slave reset is only for an explicit bus reset, and leaving it armed
+   * keeps the controller from running the next command.
+   */
 
   modifyreg32(I2C_CTR_REG(priv->id), 0, I2C_FSM_RST);
+}
 
-  i2c_clear_bus(priv);
+/****************************************************************************
+ * Name: i2c_release_rtc_pin
+ *
+ * Description:
+ *   Hand an RTC-capable pad back to the digital IO MUX / GPIO matrix.
+ *
+ ****************************************************************************/
+
+static void i2c_release_rtc_pin(uint32_t pin)
+{
+  if (pin > 21)
+    {
+      return;
+    }
+
+  /* Enable bits live in [31:10], one bit per RTC GPIO. */
+
+  putreg32(UINT32_C(1) << (pin + 10), I2C_RTC_ENABLE_W1TC);
+  modifyreg32(I2C_RTC_PAD_REG(pin), I2C_RTC_PAD_CLEAR, 0);
 }
 
 /****************************************************************************
@@ -1127,11 +1168,73 @@ static int i2c_transfer(struct i2c_master_s *dev, struct i2c_msg_s *msgs,
 #ifndef CONFIG_I2C_POLLED
       if (i2c_sem_waitdone(priv) < 0)
         {
-          /* Timed out - transfer was not completed within the timeout */
+          /* The completion IRQ never arrived. If the controller did finish,
+           * the raw status bits are still set and can be drained here.
+           */
 
-          i2cerr("Message %" PRIu8 " timed out.\n", priv->msgid);
-          ret = -ETIMEDOUT;
-          break;
+          uint32_t raw = getreg32(I2C_INT_RAW_REG(priv->id));
+          int drained = -ETIMEDOUT;
+          int step;
+
+          for (step = 0; step < 8; step++)
+            {
+              uint32_t status = getreg32(I2C_INT_STATUS_REG(priv->id));
+
+              if (status == 0)
+                {
+                  status = getreg32(I2C_INT_RAW_REG(priv->id));
+                  status &= I2C_TRANS_COMPLETE_INT_ST |
+                            I2C_END_DETECT_INT_ST |
+                            I2C_INT_ERR_MASK;
+                }
+
+              if (status == 0)
+                {
+                  break;
+                }
+
+              putreg32(status, I2C_INT_CLR_REG(priv->id));
+              i2c_process(priv, status);
+              nxsem_trywait(&priv->sem_isr);
+
+              if (priv->error != 0)
+                {
+                  drained = -EIO;
+                  break;
+                }
+
+              if (priv->i2cstate == I2CSTATE_FINISH)
+                {
+                  i2c_intr_disable(priv);
+                  drained = OK;
+                  break;
+                }
+            }
+
+          if (drained < 0)
+            {
+              static bool logged = false;
+
+              if (!logged)
+                {
+                  logged = true;
+                  syslog(LOG_ERR,
+                         "I2C%d timeout raw=%08" PRIx32
+                         " sr=%08" PRIx32 " ctr=%08" PRIx32
+                         " in=%08" PRIx32 "\n",
+                         priv->id, raw,
+                         getreg32(I2C_SR_REG(priv->id)),
+                         getreg32(I2C_CTR_REG(priv->id)),
+                         getreg32(GPIO_IN_REG));
+                }
+
+              i2cerr("Message %" PRIu8 " timed out.\n", priv->msgid);
+              ret = drained;
+              break;
+            }
+
+          priv->i2cstate = I2CSTATE_IDLE;
+          ret = OK;
         }
       else
         {
@@ -1198,6 +1301,7 @@ static int i2c_transfer(struct i2c_master_s *dev, struct i2c_msg_s *msgs,
  *
  ****************************************************************************/
 
+#ifdef CONFIG_I2C_RESET
 static void i2c_clear_bus(struct esp32s3_i2c_priv_s *priv)
 {
   modifyreg32(I2C_SCL_SP_CONF_REG(priv->id),
@@ -1208,6 +1312,7 @@ static void i2c_clear_bus(struct esp32s3_i2c_priv_s *priv)
 
   modifyreg32(I2C_SCL_SP_CONF_REG(priv->id), 0, I2C_SCL_RST_SLV_EN);
 }
+#endif
 
 /****************************************************************************
  * Name: i2c_reset
