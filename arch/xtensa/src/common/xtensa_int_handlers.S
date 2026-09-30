@@ -161,9 +161,17 @@ g_intstacktop:
 	addi	sp, sp, XCPTCONTEXT_SIZE
 #endif
 
-	/* Done */
+	j		2f
+
+	/* No interrupt was left pending. a2 is still a register from the
+	 * interrupted task, not the save area. _xtensa_context_restore treats
+	 * a2 as that pointer; the save area is in a12. Using the stale a2
+	 * faults in the coprocessor restore (observed: a2=1, EXCVADDR=0x69).
+	 */
 
 1:
+	mov		a2, a12
+2:
 	.endm
 
 /****************************************************************************
