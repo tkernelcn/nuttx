@@ -213,13 +213,17 @@ extern uint32_t _ebss_extmem;       /* End+1 of external memory bss */
  * with chip-specific functions of the same name if needed.  See also
  * functions prototyped in include/nuttx/arch.h.
  */
-
+#ifdef __cplusplus
+extern "C" {
+#endif
 /* Atomic modification of registers */
 
 void modifyreg8(unsigned int addr, uint8_t clearbits, uint8_t setbits);
 void modifyreg16(unsigned int addr, uint16_t clearbits, uint16_t setbits);
 void modifyreg32(unsigned int addr, uint32_t clearbits, uint32_t setbits);
-
+#ifdef __cplusplus
+}
+#endif
 /* Serial output */
 
 void up_lowputs(const char *str);
